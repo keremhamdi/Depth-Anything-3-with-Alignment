@@ -3,31 +3,29 @@ from scipy.optimize import minimize
 from scipy.ndimage import distance_transform_edt
 
 from depth_anything_3.alignment.poisson_alignment import poisson_align
+from experiment_paths import parse_experiment_paths
 
 
-GT = (
-    "experiments/ibims_replication/oracle_inputs/"
-    "lectureroom_01_gt.npy"
+DATA_ROOT, _ = parse_experiment_paths(
+    description="Evaluate DA3 and Poisson alignment on iBims lectureroom_01."
 )
 
+GT = DATA_ROOT / "experiments/ibims_replication/oracle_inputs/lectureroom_01_gt.npy"
 MASK = (
-    "experiments/ibims_replication/oracle_inputs/"
-    "lectureroom_01_mask_invalid.npy"
+    DATA_ROOT
+    / "experiments/ibims_replication/oracle_inputs/lectureroom_01_mask_invalid.npy"
 )
-
 A2F = (
-    "experiments/ibims_replication/da3_bridge_a2f_rel/"
-    "lectureroom_01_rel.npy"
+    DATA_ROOT
+    / "experiments/ibims_replication/da3_bridge_a2f_rel/lectureroom_01_rel.npy"
 )
-
 DA3 = (
-    "experiments/ibims_replication/da3_bridge/"
-    "lectureroom_01_da3small.npy"
+    DATA_ROOT
+    / "experiments/ibims_replication/da3_bridge/lectureroom_01_da3small.npy"
 )
-
 SPARSE = (
-    "experiments/ibims_replication/v2_1_sensor/"
-    "lectureroom_01.npy"
+    DATA_ROOT
+    / "experiments/ibims_replication/v2_1_sensor/lectureroom_01.npy"
 )
 
 

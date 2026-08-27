@@ -1,4 +1,3 @@
-from pathlib import Path
 import csv
 
 import matplotlib
@@ -6,24 +5,18 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+from experiment_paths import parse_experiment_paths
 
 
-SPARSE_DIRECTORY = Path(
-    "experiments/ibims_replication/v2_1_sensor_32m"
+DATA_ROOT, OUTPUT_DIRECTORY = parse_experiment_paths(
+    description="Analyze 100-scene DA3 support for the 32 m V2.1 sensor simulation.",
+    output_subdirectory="analysis_100",
 )
 
-DA3_DIRECTORY = Path(
-    "experiments/ibims_replication/da3_bridge_all"
+SPARSE_DIRECTORY = (
+    DATA_ROOT / "experiments/ibims_replication/v2_1_sensor_32m"
 )
-
-OUTPUT_DIRECTORY = Path(
-    "experiments/ibims_replication/analysis_100"
-)
-
-OUTPUT_DIRECTORY.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+DA3_DIRECTORY = DATA_ROOT / "experiments/ibims_replication/da3_bridge_all"
 
 
 records = []

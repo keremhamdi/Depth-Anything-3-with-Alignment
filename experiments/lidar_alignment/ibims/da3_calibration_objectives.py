@@ -1,45 +1,32 @@
-from pathlib import Path
-
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 from scipy.optimize import least_squares, minimize
+from experiment_paths import parse_experiment_paths
 
 
-GT_PATH = Path(
-    "experiments/ibims_replication/oracle_inputs/"
-    "lectureroom_01_gt.npy"
+DATA_ROOT, OUTPUT_DIRECTORY = parse_experiment_paths(
+    description="Compare DA3 calibration objectives on iBims lectureroom_01.",
+    output_subdirectory="calibration_objectives",
 )
 
-MASK_PATH = Path(
-    "experiments/ibims_replication/oracle_inputs/"
-    "lectureroom_01_mask_invalid.npy"
+GT_PATH = (
+    DATA_ROOT
+    / "experiments/ibims_replication/oracle_inputs/lectureroom_01_gt.npy"
 )
-
-DA3_PATH = Path(
-    "experiments/ibims_replication/da3_bridge/"
-    "lectureroom_01_da3small.npy"
+MASK_PATH = (
+    DATA_ROOT
+    / "experiments/ibims_replication/oracle_inputs/lectureroom_01_mask_invalid.npy"
 )
-
-SPARSE_PATH = Path(
-    "experiments/ibims_replication/v2_1_sensor/"
-    "lectureroom_01.npy"
+DA3_PATH = (
+    DATA_ROOT
+    / "experiments/ibims_replication/da3_bridge/lectureroom_01_da3small.npy"
 )
-
-RGB_PATH = Path(
-    "datasets/ibims1/ibims1_core_raw/rgb/"
-    "lectureroom_01.png"
+SPARSE_PATH = (
+    DATA_ROOT
+    / "experiments/ibims_replication/v2_1_sensor/lectureroom_01.npy"
 )
-
-OUTPUT_DIRECTORY = Path(
-    "experiments/ibims_replication/"
-    "calibration_objectives"
-)
-
-OUTPUT_DIRECTORY.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+RGB_PATH = DATA_ROOT / "datasets/ibims1/ibims1_core_raw/rgb/lectureroom_01.png"
 
 
 def fit_ls(x, y):

@@ -1,10 +1,24 @@
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from experiment_paths import parse_experiment_paths
 
-GT = "experiments/ibims_replication/oracle_inputs/lectureroom_01_gt.npy"
-A2F = "experiments/ibims_replication/da3_bridge_a2f_rel/lectureroom_01_rel.npy"
-DA3 = "experiments/ibims_replication/da3_bridge/lectureroom_01_da3small.npy"
-SPARSE = "experiments/ibims_replication/v2_1_sensor/lectureroom_01.npy"
+DATA_ROOT, _ = parse_experiment_paths(
+    description="Compare Any2Full and DA3 oracle bridges on iBims lectureroom_01."
+)
+
+GT = DATA_ROOT / "experiments/ibims_replication/oracle_inputs/lectureroom_01_gt.npy"
+A2F = (
+    DATA_ROOT
+    / "experiments/ibims_replication/da3_bridge_a2f_rel/lectureroom_01_rel.npy"
+)
+DA3 = (
+    DATA_ROOT
+    / "experiments/ibims_replication/da3_bridge/lectureroom_01_da3small.npy"
+)
+SPARSE = (
+    DATA_ROOT
+    / "experiments/ibims_replication/v2_1_sensor/lectureroom_01.npy"
+)
 
 
 def fit_affine(x, y):
