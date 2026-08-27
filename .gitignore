@@ -34,3 +34,16 @@ src/debug_main.py
 src/outputs
 temp*.png
 /outputs
+
+# LiDAR alignment local artifacts
+*.npy
+*.npz
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+/datasets/
+/checkpoints/
+/weights/
+/experiments/**/outputs/
+/experiments/**/results/

@@ -6,6 +6,8 @@ einops
 huggingface_hub
 imageio
 numpy<2
+scipy
+matplotlib
 opencv-python
 xformers
 open3d
