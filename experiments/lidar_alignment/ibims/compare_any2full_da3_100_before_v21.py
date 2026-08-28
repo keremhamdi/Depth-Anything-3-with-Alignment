@@ -1,8 +1,8 @@
-"""Matched 100-scene comparison of Any2Full and DA3 alignments on iBims V2.1.
+"""Matched 100-scene comparison of Any2Full and DA3 LiDAR alignments on iBims.
 
-Every method uses the same V2.1 sparse-LiDAR map. Dense ground truth is used only
-for evaluation, never for fitting. Positive surplus means a method has lower
-error than the original Any2Full prediction.
+Every method uses the same V2 sparse-LiDAR map. Dense ground truth is used only
+for evaluation, never for fitting. Positive surplus means a DA3 method has lower
+error than Any2Full.
 """
 
 import argparse
@@ -20,7 +20,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
-from scipy.interpolate import PchipInterpolator
 from scipy.io import loadmat
 from scipy.optimize import least_squares, minimize
 from scipy.stats import spearmanr
@@ -30,22 +29,12 @@ from depth_anything_3.alignment.poisson_alignment import poisson_align
 
 METHOD_LABELS = {
     "any2full": "Any2Full",
-    "any2full_monotonic": "Any2Full + monotonic recalibration",
     "da3_median": "DA3 + median scale",
     "da3_ls": "DA3 + affine LS",
     "da3_log_ls": "DA3 + positive log-LS",
     "da3_huber": "DA3 + Huber",
-    "da3_monotonic": "DA3 + monotonic recalibration",
     "da3_ls_poisson": "DA3 + affine LS + Poisson",
 }
-
-DA3_GLOBAL_ALIGNMENT_METHODS = (
-    "da3_median",
-    "da3_ls",
-    "da3_log_ls",
-    "da3_huber",
-    "da3_monotonic",
-)
 
 REGION_LABELS = {
     "all": "All valid pixels",
@@ -67,9 +56,8 @@ def parse_arguments():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Compare Any2Full with monotonic recalibration and DA3 median, affine, "
-            "log-affine, Huber, monotonic, and affine-plus-Poisson alignment on "
-            "matched iBims V2.1 inputs."
+            "Compare Any2Full with DA3 median, affine, log-affine, Huber, "
+            "and affine-plus-Poisson alignment on matched iBims V2 inputs."
         )
     )
     parser.add_argument(
@@ -84,7 +72,7 @@ def parse_arguments():
         type=Path,
         default=(
             repository_root
-                / "experiments/lidar_alignment/outputs/comparison_any2full_da3_v21_100"
+            / "experiments/lidar_alignment/outputs/comparison_any2full_da3_v2_100"
         ),
     )
     parser.add_argument("--scene", help="Evaluate one scene only, for a smoke test.")
@@ -167,8 +155,8 @@ def audit_inputs(data_root):
     directories = {
         "ground_truth": data_root / "datasets/ibims1/ibims1_core_mat",
         "rgb": data_root / "datasets/ibims1/ibims1_core_raw/rgb",
-        "sparse_v21": base / "v2_1_sensor",
-        "any2full_v21": base / "predictions_v2_1_sensor",
+        "sparse_v2": base / "v2_sensor",
+        "any2full_v2": base / "predictions_v2_sensor",
         "da3": base / "da3_bridge_all",
     }
     missing_directories = [str(path) for path in directories.values() if not path.is_dir()]
@@ -180,11 +168,9 @@ def audit_inputs(data_root):
     ground_truth_scenes = {
         path.stem for path in directories["ground_truth"].glob("*.mat")
     }
-    sparse_scenes = {path.stem for path in directories["sparse_v21"].glob("*.npy")}
+    sparse_scenes = {path.stem for path in directories["sparse_v2"].glob("*.npy")}
     any2full_scenes = {
-        path.stem
-        for path in directories["any2full_v21"].glob("*.npy")
-        if not path.stem.endswith("_rel")
+        path.stem for path in directories["any2full_v2"].glob("*.npy")
     }
     da3_scenes = set()
     for path in directories["da3"].glob("*.npy"):
@@ -198,8 +184,8 @@ def audit_inputs(data_root):
 
     scene_sets = {
         "ground_truth": ground_truth_scenes,
-        "sparse_v21": sparse_scenes,
-        "any2full_v21": any2full_scenes,
+        "sparse_v2": sparse_scenes,
+        "any2full_v2": any2full_scenes,
         "da3": da3_scenes,
         "rgb": rgb_scenes,
     }
@@ -283,113 +269,6 @@ def fit_huber(relative_depth, metric_depth, initial_scale, initial_shift, delta=
     return float(result.x[0]), float(result.x[1])
 
 
-def isotonic_regression(values, weights, increasing):
-    """Weighted pool-adjacent-violators fit without a scikit-learn dependency."""
-    signed = np.asarray(values, dtype=np.float64) * (1.0 if increasing else -1.0)
-    weights = np.asarray(weights, dtype=np.float64)
-    blocks = []
-    for index, (value, weight) in enumerate(zip(signed, weights)):
-        blocks.append([index, index, float(weight), float(value)])
-        while len(blocks) >= 2 and blocks[-2][3] > blocks[-1][3]:
-            right = blocks.pop()
-            left = blocks.pop()
-            total_weight = left[2] + right[2]
-            pooled_value = (left[2] * left[3] + right[2] * right[3]) / total_weight
-            blocks.append([left[0], right[1], total_weight, pooled_value])
-
-    fitted = np.empty_like(signed)
-    for start, end, _, value in blocks:
-        fitted[start : end + 1] = value
-    return fitted * (1.0 if increasing else -1.0)
-
-
-def monotonic_recalibrate(source, sparse, anchor_mask, max_knots=12, regularization=0.15):
-    """Fit a robust monotonic source-to-metric curve using LiDAR anchors only."""
-    source_anchors = source[anchor_mask]
-    metric_anchors = sparse[anchor_mask]
-    usable = (
-        np.isfinite(source_anchors)
-        & np.isfinite(metric_anchors)
-        & (source_anchors > 0)
-        & (metric_anchors > 0)
-    )
-    source_anchors = source_anchors[usable]
-    metric_anchors = metric_anchors[usable]
-    if source_anchors.size < 4:
-        raise ValueError("Monotonic recalibration requires at least four usable anchors.")
-
-    affine_scale, affine_shift = fit_affine_ls(source_anchors, metric_anchors)
-    correlation = spearmanr(source_anchors, metric_anchors).statistic
-    increasing = bool(correlation >= 0) if np.isfinite(correlation) else affine_scale >= 0
-
-    order = np.argsort(source_anchors, kind="mergesort")
-    knot_count = min(max_knots, max(4, int(round(np.sqrt(source_anchors.size)))))
-    chunks = [chunk for chunk in np.array_split(order, knot_count) if chunk.size]
-    knot_x = np.array([np.median(source_anchors[chunk]) for chunk in chunks])
-    knot_y = np.array([np.median(metric_anchors[chunk]) for chunk in chunks])
-    knot_weights = np.array([chunk.size for chunk in chunks], dtype=np.float64)
-
-    unique_x, inverse = np.unique(knot_x, return_inverse=True)
-    if unique_x.size != knot_x.size:
-        collapsed_y = np.zeros(unique_x.size, dtype=np.float64)
-        collapsed_weights = np.zeros(unique_x.size, dtype=np.float64)
-        for index, group in enumerate(inverse):
-            collapsed_y[group] += knot_weights[index] * knot_y[index]
-            collapsed_weights[group] += knot_weights[index]
-        knot_x = unique_x
-        knot_y = collapsed_y / collapsed_weights
-        knot_weights = collapsed_weights
-
-    if knot_x.size < 3:
-        aligned = np.maximum(affine_scale * source + affine_shift, 1e-4)
-        anchor_error = aligned[anchor_mask][usable] - metric_anchors
-        return aligned, {
-            "mode": "affine_fallback",
-            "knot_count": int(knot_x.size),
-            "increasing": bool(increasing),
-            "spearman": float(correlation),
-            "anchor_rmse_m": float(np.sqrt(np.mean(anchor_error**2))),
-        }
-
-    knot_y = isotonic_regression(knot_y, knot_weights, increasing)
-    affine_at_knots = affine_scale * knot_x + affine_shift
-    knot_y = (1.0 - regularization) * knot_y + regularization * affine_at_knots
-    knot_y = isotonic_regression(knot_y, knot_weights, increasing)
-    knot_y = np.maximum(knot_y, 1e-4)
-
-    interpolator = PchipInterpolator(knot_x, knot_y, extrapolate=False)
-    valid_source = np.isfinite(source)
-    aligned = np.full_like(source, np.nan, dtype=np.float64)
-    inside = valid_source & (source >= knot_x[0]) & (source <= knot_x[-1])
-    aligned[inside] = interpolator(source[inside])
-
-    direction = 1.0 if increasing else -1.0
-    global_slope = (knot_y[-1] - knot_y[0]) / (knot_x[-1] - knot_x[0])
-    slope_limit = max(3.0 * abs(global_slope), 1e-12)
-    derivative = interpolator.derivative()
-
-    def controlled_slope(location):
-        directed = direction * float(derivative(location))
-        return direction * float(np.clip(directed, 0.0, slope_limit))
-
-    left = valid_source & (source < knot_x[0])
-    right = valid_source & (source > knot_x[-1])
-    aligned[left] = knot_y[0] + controlled_slope(knot_x[0]) * (source[left] - knot_x[0])
-    aligned[right] = knot_y[-1] + controlled_slope(knot_x[-1]) * (source[right] - knot_x[-1])
-    aligned[valid_source] = np.maximum(aligned[valid_source], 1e-4)
-
-    anchor_prediction = aligned[anchor_mask][usable]
-    anchor_error = anchor_prediction - metric_anchors
-    return aligned, {
-        "mode": "regularized_pchip",
-        "knot_count": int(knot_x.size),
-        "increasing": bool(increasing),
-        "spearman": float(correlation),
-        "regularization": float(regularization),
-        "anchor_rmse_m": float(np.sqrt(np.mean(anchor_error**2))),
-    }
-
-
 def calculate_metrics(prediction, ground_truth, mask):
     count = int(mask.sum())
     if count == 0:
@@ -439,16 +318,12 @@ def build_predictions(da3, sparse, anchor_mask, include_poisson, poisson_rtol, p
     huber_scale, huber_shift = fit_huber(
         relative_anchors, metric_anchors, ls_scale, ls_shift
     )
-    monotonic_prediction, monotonic_diagnostics = monotonic_recalibrate(
-        da3, sparse, anchor_mask
-    )
 
     predictions = {
         "da3_median": median_scale * da3 + median_shift,
         "da3_ls": ls_scale * da3 + ls_shift,
         "da3_log_ls": log_scale * da3 + log_shift,
         "da3_huber": huber_scale * da3 + huber_shift,
-        "da3_monotonic": monotonic_prediction,
     }
     poisson_diagnostics = None
     if include_poisson:
@@ -480,9 +355,6 @@ def build_predictions(da3, sparse, anchor_mask, include_poisson, poisson_rtol, p
         "huber_scale": huber_scale,
         "huber_shift": huber_shift,
     }
-    fit_diagnostics.update(
-        {f"da3_monotonic_{key}": value for key, value in monotonic_diagnostics.items()}
-    )
     return predictions, fit_diagnostics, poisson_diagnostics
 
 
@@ -641,7 +513,7 @@ def print_main_tables(summary_rows, surplus_summary):
             f"Bias={row['macro_mean_bias_m']:+7.3f} m"
         )
 
-    print("\n========== METHOD SURPLUS OVER ORIGINAL ANY2FULL ==========")
+    print("\n========== DA3 SURPLUS OVER ANY2FULL ==========")
     selected = [row for row in surplus_summary if row["region"] == "all"]
     selected.sort(key=lambda row: row["mean_absrel_surplus_pp"], reverse=True)
     for row in selected:
@@ -677,7 +549,7 @@ def plot_summary(summary_rows, output_directory):
     axes[0].grid(axis="x", alpha=0.25)
     axes[1].barh(labels, rmse, color="#dc3912")
     axes[1].set_xlabel("Macro mean RMSE (m)")
-    axes[1].set_title("Matched V2.1 LiDAR input")
+    axes[1].set_title("Matched V2 LiDAR input")
     axes[1].grid(axis="x", alpha=0.25)
     figure.tight_layout()
     figure.savefig(output_directory / "method_summary.png", dpi=180)
@@ -769,19 +641,12 @@ def create_scene_visual(
     ground_truth, valid = load_ibims_ground_truth(
         directories["ground_truth"] / f"{scene}.mat"
     )
-    sparse = load_array(directories["sparse_v21"] / f"{scene}.npy", ground_truth.shape)
+    sparse = load_array(directories["sparse_v2"] / f"{scene}.npy", ground_truth.shape)
     any2full = load_array(
-        directories["any2full_v21"] / f"{scene}.npy", ground_truth.shape
+        directories["any2full_v2"] / f"{scene}.npy", ground_truth.shape
     )
     da3 = load_array(resolve_da3_path(directories["da3"], scene), ground_truth.shape)
-    anchor_mask = (
-        np.isfinite(sparse)
-        & (sparse > 0)
-        & np.isfinite(da3)
-        & (da3 > 0)
-        & np.isfinite(any2full)
-        & (any2full > 0)
-    )
+    anchor_mask = np.isfinite(sparse) & (sparse > 0) & np.isfinite(da3) & (da3 > 0)
     predictions, _, _ = build_predictions(
         da3,
         sparse,
@@ -790,9 +655,6 @@ def create_scene_visual(
         poisson_rtol,
         poisson_maxiter,
     )
-    any2full_monotonic, _ = monotonic_recalibrate(any2full, sparse, anchor_mask)
-    predictions["any2full"] = any2full
-    predictions["any2full_monotonic"] = any2full_monotonic
     candidate = predictions[best_method]
     rgb = Image.open(resolve_rgb_path(directories["rgb"], scene)).convert("RGB")
     rgb = rgb.resize((ground_truth.shape[1], ground_truth.shape[0]))
@@ -800,62 +662,48 @@ def create_scene_visual(
 
     gt_display = np.where(valid, ground_truth, np.nan)
     any2full_display = np.where(valid, any2full, np.nan)
-    any2full_monotonic_display = np.where(valid, any2full_monotonic, np.nan)
     candidate_display = np.where(valid, candidate, np.nan)
     error_a2f = np.where(valid, np.abs(any2full - ground_truth), np.nan)
-    error_a2f_monotonic = np.where(
-        valid, np.abs(any2full_monotonic - ground_truth), np.nan
-    )
     error_da3 = np.where(valid, np.abs(candidate - ground_truth), np.nan)
     improvement = np.where(valid, error_a2f - error_da3, np.nan)
     depth_min, depth_max = np.nanpercentile(gt_display, [1, 99])
-    error_max = np.nanpercentile(
-        np.concatenate(
-            [error_a2f[valid], error_a2f_monotonic[valid], error_da3[valid]]
-        ),
-        95,
-    )
+    error_max = np.nanpercentile(np.concatenate([error_a2f[valid], error_da3[valid]]), 95)
     advantage_max = np.nanpercentile(np.abs(improvement[valid]), 95)
 
-    figure, axes = plt.subplots(2, 5, figsize=(26, 10), constrained_layout=True)
+    figure, axes = plt.subplots(2, 4, figsize=(20, 9))
     axes[0, 0].imshow(overlay)
     yy, xx = np.nonzero(anchor_mask)
     scatter = axes[0, 0].scatter(
         xx, yy, c=sparse[anchor_mask], s=5, cmap="turbo",
         vmin=depth_min, vmax=depth_max
     )
-    axes[0, 0].set_title(f"RGB + V2.1 LiDAR ({anchor_mask.sum()} anchors)")
+    axes[0, 0].set_title(f"RGB + V2 LiDAR ({anchor_mask.sum()} anchors)")
     image_gt = axes[0, 1].imshow(gt_display, cmap="turbo", vmin=depth_min, vmax=depth_max)
     axes[0, 1].set_title("Ground-truth depth")
     axes[0, 2].imshow(any2full_display, cmap="turbo", vmin=depth_min, vmax=depth_max)
     axes[0, 2].set_title("Any2Full prediction")
-    axes[0, 3].imshow(
-        any2full_monotonic_display, cmap="turbo", vmin=depth_min, vmax=depth_max
-    )
-    axes[0, 3].set_title("Any2Full + monotonic")
-    axes[0, 4].imshow(candidate_display, cmap="turbo", vmin=depth_min, vmax=depth_max)
-    axes[0, 4].set_title(METHOD_LABELS[best_method])
+    axes[0, 3].imshow(candidate_display, cmap="turbo", vmin=depth_min, vmax=depth_max)
+    axes[0, 3].set_title(METHOD_LABELS[best_method])
     axes[1, 0].imshow(sparse_display, cmap="turbo", vmin=depth_min, vmax=depth_max)
     axes[1, 0].set_title("Sparse metric depth")
     image_error = axes[1, 1].imshow(error_a2f, cmap="magma", vmin=0, vmax=error_max)
     axes[1, 1].set_title("Any2Full absolute error")
-    axes[1, 2].imshow(error_a2f_monotonic, cmap="magma", vmin=0, vmax=error_max)
-    axes[1, 2].set_title("A2F monotonic absolute error")
-    axes[1, 3].imshow(error_da3, cmap="magma", vmin=0, vmax=error_max)
-    axes[1, 3].set_title("DA3 absolute error")
-    image_advantage = axes[1, 4].imshow(
+    axes[1, 2].imshow(error_da3, cmap="magma", vmin=0, vmax=error_max)
+    axes[1, 2].set_title("DA3 absolute error")
+    image_advantage = axes[1, 3].imshow(
         improvement, cmap="RdBu", vmin=-advantage_max, vmax=advantage_max
     )
-    axes[1, 4].set_title("Advantage: A2F error − DA3 error")
+    axes[1, 3].set_title("Per-pixel advantage: A2F error − DA3 error")
     for axis in axes.ravel():
         axis.axis("off")
     figure.colorbar(scatter, ax=axes[0, 0], fraction=0.046, label="Depth (m)")
-    figure.colorbar(image_gt, ax=axes[0, 1:5], fraction=0.02, label="Depth (m)")
-    figure.colorbar(image_error, ax=axes[1, 1:4], fraction=0.03, label="Absolute error (m)")
+    figure.colorbar(image_gt, ax=axes[0, 1:4], fraction=0.02, label="Depth (m)")
+    figure.colorbar(image_error, ax=axes[1, 1:3], fraction=0.03, label="Absolute error (m)")
     figure.colorbar(
-        image_advantage, ax=axes[1, 4], fraction=0.046, label="Improvement (m)"
+        image_advantage, ax=axes[1, 3], fraction=0.046, label="Improvement (m)"
     )
-    figure.suptitle(f"{rank.title()} non-anchor surplus scene: {scene}", fontsize=16)
+    figure.suptitle(f"{rank.title()} surplus scene: {scene}", fontsize=16)
+    figure.subplots_adjust(top=0.91, wspace=0.08, hspace=0.12)
     visual_directory = output_directory / "visuals"
     visual_directory.mkdir(parents=True, exist_ok=True)
     figure.savefig(
@@ -870,7 +718,7 @@ def select_visual_scenes(surplus_rows, best_method):
     rows = [
         row
         for row in surplus_rows
-        if row["region"] == "non_anchor" and row["method"] == best_method
+        if row["region"] == "all" and row["method"] == best_method
     ]
     rows.sort(key=lambda row: row["absrel_surplus_pp"])
     return {
@@ -916,10 +764,10 @@ def main():
             directories["ground_truth"] / f"{scene}.mat"
         )
         sparse = load_array(
-            directories["sparse_v21"] / f"{scene}.npy", ground_truth.shape
+            directories["sparse_v2"] / f"{scene}.npy", ground_truth.shape
         )
         any2full = load_array(
-            directories["any2full_v21"] / f"{scene}.npy", ground_truth.shape
+            directories["any2full_v2"] / f"{scene}.npy", ground_truth.shape
         )
         da3 = load_array(resolve_da3_path(directories["da3"], scene), ground_truth.shape)
 
@@ -928,8 +776,6 @@ def main():
             & (sparse > 0)
             & np.isfinite(da3)
             & (da3 > 0)
-            & np.isfinite(any2full)
-            & (any2full > 0)
         )
         if anchor_mask.sum() < 3:
             raise ValueError(f"{scene} has only {anchor_mask.sum()} usable anchors.")
@@ -943,16 +789,6 @@ def main():
             arguments.poisson_maxiter,
         )
         predictions["any2full"] = any2full
-        any2full_monotonic, any2full_monotonic_diagnostics = monotonic_recalibrate(
-            any2full, sparse, anchor_mask
-        )
-        predictions["any2full_monotonic"] = any2full_monotonic
-        fit_diagnostics.update(
-            {
-                f"any2full_monotonic_{key}": value
-                for key, value in any2full_monotonic_diagnostics.items()
-            }
-        )
         fit_diagnostics["scene"] = scene
         fit_diagnostics["valid_pixel_count"] = int(valid.sum())
         fit_rows.append(fit_diagnostics)
@@ -1013,7 +849,6 @@ def main():
         "poisson_rtol": arguments.poisson_rtol,
         "poisson_maxiter": arguments.poisson_maxiter,
         "methods": active_methods,
-        "da3_global_alignment_methods": list(DA3_GLOBAL_ALIGNMENT_METHODS),
         "missing_by_source": missing_by_source,
     }
     with (output_directory / "run_configuration.json").open(
@@ -1027,16 +862,12 @@ def main():
         (
             row
             for row in summary_rows
-            if row["region"] == "non_anchor"
-            and row["method"] in DA3_GLOBAL_ALIGNMENT_METHODS
+            if row["region"] == "all" and row["method"] != "any2full"
         ),
         key=lambda row: row["macro_mean_absrel_pct"],
     )
     best_method = best_row["method"]
-    print(
-        "\nBest DA3 global alignment by macro non-anchor AbsRel: "
-        f"{METHOD_LABELS[best_method]}"
-    )
+    print(f"\nBest DA3 method by macro all-pixel AbsRel: {METHOD_LABELS[best_method]}")
 
     if not arguments.no_visuals:
         plot_summary(summary_rows, output_directory)
