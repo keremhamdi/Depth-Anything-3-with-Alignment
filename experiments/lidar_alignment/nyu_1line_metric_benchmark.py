@@ -4,7 +4,8 @@
 This script implements the fixed comparison requested for the indoor project:
 
 * official NYU-Depth V2 654-image test split at 304 x 228;
-* one identical RPLidar-like horizontal sparse input for every method;
+* two explicit one-line protocols: a paper-style ideal row and an empirical
+  RPLidar pattern copied from the project's unsplatted real projections;
 * DA3-SMALL, one-line median metric scaling, then Poisson refinement;
 * Any2Full predictions produced by the repository's existing run_any2full.py;
 * dense metric evaluation over the complete valid image and outside the line;
@@ -22,7 +23,9 @@ Prepare the official test split::
     python nyu_1line_metric_benchmark.py prepare \
       --nyu-mat /path/to/nyu_depth_v2_labeled.mat \
       --splits-mat /path/to/splits.mat \
-      --data-root datasets/nyu_1line_rplidar43
+      --data-root datasets/nyu_empirical_rplidar \
+      --line-protocol empirical_rplidar \
+      --real-template-dir /path/to/prepared/depth_full_points
 
 Run DA3, median metric scaling, and Poisson refinement inside the DA3 environment::
 
@@ -64,9 +67,11 @@ DEFAULT_WIDTH = 304
 DEFAULT_HEIGHT = 228
 DEFAULT_LINE_ROW_FRAC = 0.465
 DEFAULT_LINE_POINTS = 43
-DEFAULT_SPLAT_RADIUS = 1
+DEFAULT_SPLAT_RADIUS = 0
 DEFAULT_MAX_DEPTH_M = 10.0
 DEFAULT_OUTSIDE_MARGIN_PX = 10
+LINE_PROTOCOLS = ("paper_row", "empirical_rplidar")
+BENCHMARK_VERSION = "2.2-poisson-safe-single-pixel-support"
 METHOD_LABELS = {
     "da3_median": "DA3-SMALL + median",
     "da3_median_poisson": "DA3-SMALL + median + Poisson",
@@ -101,7 +106,33 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--height", type=positive_int, default=DEFAULT_HEIGHT)
     prepare.add_argument("--line-row-frac", type=unit_interval, default=DEFAULT_LINE_ROW_FRAC)
     prepare.add_argument("--line-points", type=positive_int, default=DEFAULT_LINE_POINTS)
-    prepare.add_argument("--splat-radius", type=int, default=DEFAULT_SPLAT_RADIUS)
+    prepare.add_argument(
+        "--splat-radius",
+        type=int,
+        default=None,
+        help="Optional input replication radius; default 0 for both protocols (one pixel per return)",
+    )
+    prepare.add_argument(
+        "--line-protocol",
+        choices=LINE_PROTOCOLS,
+        default="paper_row",
+        help=(
+            "paper_row uses evenly spaced one-line centers; empirical_rplidar transfers "
+            "normalized positions from real unsplatted depth_full_points maps"
+        ),
+    )
+    prepare.add_argument(
+        "--real-template-dir",
+        type=Path,
+        default=None,
+        help="Directory containing the real unsplatted depth_full_points/*.npy templates",
+    )
+    prepare.add_argument(
+        "--template-seed",
+        type=int,
+        default=20260901,
+        help="Deterministic seed used to assign real templates to NYU scenes",
+    )
     prepare.add_argument("--max-depth-m", type=float, default=DEFAULT_MAX_DEPTH_M)
     prepare.add_argument("--limit", type=positive_int, default=None)
     prepare.add_argument("--overwrite", action="store_true")
@@ -272,42 +303,88 @@ def matlab_hdf5_depth(dataset: Any, index: int) -> np.ndarray:
     return array.astype(np.float32, copy=False)
 
 
-def make_one_line(
+def splat_centers(
+    gt: np.ndarray,
+    valid: np.ndarray,
+    centers_yx: np.ndarray,
+    splat_radius: int,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+    """Sample GT at independent centers, then optionally replicate for network input."""
+    if splat_radius < 0:
+        raise ValueError("--splat-radius cannot be negative")
+    height, width = gt.shape
+    exact = np.zeros_like(gt, dtype=np.float32)
+    kept: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for raw_y, raw_x in np.asarray(centers_yx, dtype=np.int32):
+        y = int(np.clip(raw_y, 0, height - 1))
+        x = int(np.clip(raw_x, 0, width - 1))
+        if (y, x) in seen or not valid[y, x]:
+            continue
+        seen.add((y, x))
+        exact[y, x] = gt[y, x]
+        kept.append((y, x))
+    if len(kept) < 8:
+        raise RuntimeError(f"Only {len(kept)} valid independent line measurements remain")
+
+    sparse_input = np.zeros_like(gt, dtype=np.float32)
+    for y, x in kept:
+        value = float(gt[y, x])
+        y0, y1 = max(0, y - splat_radius), min(height, y + splat_radius + 1)
+        x0, x1 = max(0, x - splat_radius), min(width, x + splat_radius + 1)
+        # Replication is input preprocessing, never additional sensor evidence.
+        sparse_input[y0:y1, x0:x1] = value
+    kept_array = np.asarray(kept, dtype=np.int32)
+    line_row = int(np.median(kept_array[:, 0]))
+    return exact, sparse_input, line_row, kept_array
+
+
+def make_paper_row(
     gt: np.ndarray,
     valid: np.ndarray,
     row_fraction: float,
     point_count: int,
     splat_radius: int,
 ) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
-    if splat_radius < 0:
-        raise ValueError("--splat-radius cannot be negative")
     height, width = gt.shape
     row = int(round(row_fraction * (height - 1)))
     edge_margin = max(2, splat_radius + 1)
     columns = np.rint(np.linspace(edge_margin, width - 1 - edge_margin, point_count)).astype(int)
     columns = np.unique(columns)
+    centers = np.column_stack((np.full(columns.shape, row, dtype=np.int32), columns))
+    return splat_centers(gt, valid, centers, splat_radius)
 
-    exact = np.zeros_like(gt, dtype=np.float32)
-    kept_columns: list[int] = []
-    for column in columns:
-        if valid[row, column]:
-            exact[row, column] = gt[row, column]
-            kept_columns.append(int(column))
-    if len(kept_columns) < max(8, point_count // 3):
-        raise RuntimeError(
-            f"Only {len(kept_columns)} valid line measurements at row {row}; "
-            "the chosen NYU frame is not suitable for this line pattern"
-        )
 
-    sparse_input = np.zeros_like(gt, dtype=np.float32)
-    for column in kept_columns:
-        value = float(gt[row, column])
-        y0, y1 = max(0, row - splat_radius), min(height, row + splat_radius + 1)
-        x0, x1 = max(0, column - splat_radius), min(width, column + splat_radius + 1)
-        # Replication mirrors the project's real RPLidar preprocessing.  It adds
-        # no independent measurements; the exact centers remain authoritative.
-        sparse_input[y0:y1, x0:x1] = value
-    return exact, sparse_input, row, np.asarray(kept_columns, dtype=np.int32)
+def load_empirical_templates(template_dir: Path) -> list[tuple[Path, np.ndarray]]:
+    directory = ensure_dir(template_dir, "real unsplatted template directory")
+    paths = sorted(directory.glob("*.npy"))
+    if not paths:
+        raise FileNotFoundError(f"No .npy templates found in {directory}")
+    templates: list[tuple[Path, np.ndarray]] = []
+    for path in paths:
+        array = load_npy_2d(path)
+        centers = np.argwhere(np.isfinite(array) & (array > 0)).astype(np.int32)
+        if len(centers) < 8:
+            raise RuntimeError(f"Template has fewer than 8 independent points: {path}")
+        templates.append((path, centers))
+    return templates
+
+
+def make_empirical_rplidar(
+    gt: np.ndarray,
+    valid: np.ndarray,
+    template_path: Path,
+    template_centers_yx: np.ndarray,
+    splat_radius: int,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+    """Transfer only normalized real projected positions; NYU GT supplies metric ranges."""
+    source = load_npy_2d(template_path)
+    source_h, source_w = source.shape
+    target_h, target_w = gt.shape
+    centers = np.asarray(template_centers_yx, dtype=np.float64).copy()
+    centers[:, 0] = np.rint(centers[:, 0] * (target_h - 1) / max(source_h - 1, 1))
+    centers[:, 1] = np.rint(centers[:, 1] * (target_w - 1) / max(source_w - 1, 1))
+    return splat_centers(gt, valid, centers.astype(np.int32), splat_radius)
 
 
 def prepare_dataset(args: argparse.Namespace) -> None:
@@ -316,6 +393,19 @@ def prepare_dataset(args: argparse.Namespace) -> None:
     data_root = args.data_root.expanduser().resolve()
     if args.max_depth_m <= 0:
         raise ValueError("--max-depth-m must be positive")
+    splat_radius = args.splat_radius
+    if splat_radius is None:
+        splat_radius = DEFAULT_SPLAT_RADIUS
+    if splat_radius < 0:
+        raise ValueError("--splat-radius cannot be negative")
+
+    empirical_templates: list[tuple[Path, np.ndarray]] = []
+    template_schedule: np.ndarray | None = None
+    if args.line_protocol == "empirical_rplidar":
+        if args.real_template_dir is None:
+            raise ValueError("empirical_rplidar requires --real-template-dir .../prepared/depth_full_points")
+        empirical_templates = load_empirical_templates(args.real_template_dir)
+        template_schedule = np.random.default_rng(args.template_seed).permutation(len(empirical_templates))
 
     try:
         import h5py
@@ -356,6 +446,13 @@ def prepare_dataset(args: argparse.Namespace) -> None:
                 "exact": directories["exact"] / f"{stem}.npy",
                 "input": directories["input"] / f"{stem}.npy",
             }
+            template_name = ""
+            selected_template: tuple[Path, np.ndarray] | None = None
+            if empirical_templates:
+                assert template_schedule is not None
+                template_index = int(template_schedule[(order - 1) % len(template_schedule)])
+                selected_template = empirical_templates[template_index]
+                template_name = selected_template[0].name
             if all(path.is_file() for path in paths.values()) and not args.overwrite:
                 gt = load_npy_2d(paths["gt"])
                 exact = load_npy_2d(paths["exact"], gt.shape)
@@ -370,9 +467,15 @@ def prepare_dataset(args: argparse.Namespace) -> None:
                 gt = resize_depth_nearest(matlab_hdf5_depth(depths, source_index), args.width, args.height)
                 valid = np.isfinite(gt) & (gt > 0) & (gt <= args.max_depth_m)
                 gt = np.where(valid, gt, 0.0).astype(np.float32)
-                exact, sparse_input, line_row, _ = make_one_line(
-                    gt, valid, args.line_row_frac, args.line_points, args.splat_radius
-                )
+                if args.line_protocol == "paper_row":
+                    exact, sparse_input, line_row, _ = make_paper_row(
+                        gt, valid, args.line_row_frac, args.line_points, splat_radius
+                    )
+                else:
+                    assert selected_template is not None
+                    exact, sparse_input, line_row, _ = make_empirical_rplidar(
+                        gt, valid, selected_template[0], selected_template[1], splat_radius
+                    )
                 Image.fromarray(rgb, mode="RGB").save(paths["rgb"])
                 np.save(paths["gt"], gt)
                 np.save(paths["exact"], exact)
@@ -390,9 +493,11 @@ def prepare_dataset(args: argparse.Namespace) -> None:
                     "width": int(gt.shape[1]),
                     "line_row": line_row,
                     "line_row_fraction": args.line_row_frac,
+                    "line_protocol": args.line_protocol,
+                    "real_template": template_name,
                     "independent_measurements": exact_count,
                     "sparse_input_pixels": input_count,
-                    "splat_radius": args.splat_radius,
+                    "splat_radius": splat_radius,
                     "max_depth_m": args.max_depth_m,
                 }
             )
@@ -404,18 +509,24 @@ def prepare_dataset(args: argparse.Namespace) -> None:
 
     save_csv(data_root / "manifest.csv", manifest)
     protocol = {
+        "benchmark_version": BENCHMARK_VERSION,
         "dataset": "NYU-Depth V2",
         "split": "official testNdxs, expected 654 images when --limit is omitted",
         "resolution": [args.width, args.height],
         "ground_truth": "NYU in-painted depths, camera-forward metric depth in metres",
+        "line_protocol": args.line_protocol,
         "line_row_fraction": args.line_row_frac,
         "independent_line_measurements_requested": args.line_points,
-        "splat_radius_pixels": args.splat_radius,
+        "splat_radius_pixels": splat_radius,
         "sparse_input_rule": "same sparse_input_m float32 NPY is supplied to DA3 alignment and Any2Full",
         "dense_gt_use": "construct sparse input and evaluate only; never used for post-inference alignment",
         "max_valid_depth_m": args.max_depth_m,
-        "why_43_points": "median independent-point count in the project's 15 real RPLidar frames",
-        "why_splat": "mirrors the real RPLidar preprocessing while retaining independent centers separately",
+        "paper_row_definition": "evenly spaced one-pixel centers on one horizontal row; NYU cannot supply a physical multi-ring LiDAR ring",
+        "empirical_rplidar_definition": "normalized (u,v) positions transferred from unsplatted real depth_full_points maps; real depth values are never transferred",
+        "real_template_dir": str(args.real_template_dir.expanduser().resolve()) if args.real_template_dir else None,
+        "real_template_count": len(empirical_templates),
+        "template_seed": args.template_seed,
+        "why_splat": "primary benchmark uses radius 0 (one pixel per return); nonzero radius is optional preprocessing ablation only",
     }
     (data_root / "protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
     print(f"\nPrepared {len(manifest)} NYU test images at {data_root}")
@@ -516,9 +627,29 @@ def call_poisson(
     array = np.squeeze(np.asarray(prediction, dtype=np.float32))
     if array.shape != base.shape:
         raise ValueError(f"Poisson returned {array.shape}; expected {base.shape}")
+    diagnostic_payload = (
+        dict(diagnostics) if isinstance(diagnostics, dict) else {"value": diagnostics}
+    )
+    invalid = ~np.isfinite(array) | (array <= 0)
+    invalid_count = int(np.count_nonzero(invalid))
+    if invalid_count:
+        # Metric camera-Z depth must be finite and positive.  A sparse Poisson
+        # solve can overshoot below zero at isolated pixels even when its
+        # otherwise-valid solution converged.  Repair only those invalid
+        # pixels with the already-valid median-scaled prior; leave every valid
+        # Poisson pixel untouched and record the intervention transparently.
+        array = array.copy()
+        array[invalid] = base[invalid]
     if not np.isfinite(array).all() or not (array > 0).all():
-        raise RuntimeError("Poisson produced non-positive or non-finite values")
-    return array, diagnostics if isinstance(diagnostics, dict) else {"value": diagnostics}
+        raise RuntimeError("Poisson repair did not produce a valid metric-depth map")
+    diagnostic_payload.update(
+        {
+            "invalid_pixels_repaired_from_median": invalid_count,
+            "invalid_pixel_repair_pct": 100.0 * invalid_count / float(array.size),
+            "invalid_pixel_repair_strategy": "same-pixel_da3_median_prior",
+        }
+    )
+    return array, diagnostic_payload
 
 
 def infer_da3(args: argparse.Namespace) -> None:
@@ -574,10 +705,34 @@ def infer_da3(args: argparse.Namespace) -> None:
         median, scale = median_align(relative, sparse)
         np.save(median_path, median)
         poisson_diag: dict[str, Any] = {}
+        poisson_status = "disabled"
+        poisson_full_median_fallback = False
         if poisson is not None:
-            refined, poisson_diag = call_poisson(
-                poisson, median, sparse, args.poisson_rtol, args.poisson_maxiter
-            )
+            try:
+                refined, poisson_diag = call_poisson(
+                    poisson, median, sparse, args.poisson_rtol, args.poisson_maxiter
+                )
+                repaired_count = int(
+                    poisson_diag.get("invalid_pixels_repaired_from_median", 0)
+                )
+                poisson_status = "locally_repaired" if repaired_count else "ok"
+            except (RuntimeError, FloatingPointError, ArithmeticError, np.linalg.LinAlgError) as error:
+                # A production pipeline cannot lose an entire sequence because
+                # one numerical refiner failed.  Median depth is the declared
+                # DA3 ablation and is already a valid metric map, so it is the
+                # conservative scene-level fallback.  The exact failure is
+                # recorded and printed; shape/interface errors still abort.
+                refined = median.copy()
+                poisson_full_median_fallback = True
+                poisson_status = "full_median_fallback"
+                poisson_diag = {
+                    "full_median_fallback": True,
+                    "fallback_exception_type": type(error).__name__,
+                    "fallback_reason": str(error),
+                    "invalid_pixels_repaired_from_median": int(median.size),
+                    "invalid_pixel_repair_pct": 100.0,
+                    "invalid_pixel_repair_strategy": "full_scene_da3_median_prior",
+                }
             np.save(poisson_path, refined)
 
         fit_rows.append(
@@ -589,11 +744,28 @@ def infer_da3(args: argparse.Namespace) -> None:
                 "da3_checkpoint": args.checkpoint,
                 "process_res": args.process_res,
                 "poisson_enabled": bool(poisson is not None),
+                "poisson_status": poisson_status,
+                "poisson_repaired_invalid_pixels": int(
+                    poisson_diag.get("invalid_pixels_repaired_from_median", 0)
+                ),
+                "poisson_repaired_invalid_pct": float(
+                    poisson_diag.get("invalid_pixel_repair_pct", 0.0)
+                ),
+                "poisson_full_median_fallback": poisson_full_median_fallback,
                 "poisson_diagnostics": json.dumps(poisson_diag, default=str, sort_keys=True),
             }
         )
+        poisson_note = ""
+        if poisson_status == "locally_repaired":
+            poisson_note = (
+                "; Poisson repaired "
+                f"{poisson_diag['invalid_pixels_repaired_from_median']} invalid pixels"
+            )
+        elif poisson_status == "full_median_fallback":
+            poisson_note = "; WARNING Poisson failed, full median fallback saved"
         print(
-            f"[{index:3d}/{len(rows)}] {stem} {inference_status}; median scale={scale:.6g}",
+            f"[{index:3d}/{len(rows)}] {stem} {inference_status}; "
+            f"median scale={scale:.6g}{poisson_note}",
             flush=True,
         )
 
@@ -601,6 +773,21 @@ def infer_da3(args: argparse.Namespace) -> None:
     print(f"\nDA3 + median ablation predictions: {median_dir}")
     if poisson is not None:
         print(f"Primary DA3 + median + Poisson predictions: {poisson_dir}")
+        locally_repaired_scenes = sum(
+            row["poisson_status"] == "locally_repaired" for row in fit_rows
+        )
+        full_fallback_scenes = sum(
+            bool(row["poisson_full_median_fallback"]) for row in fit_rows
+        )
+        repaired_pixels = sum(
+            int(row["poisson_repaired_invalid_pixels"]) for row in fit_rows
+        )
+        print(
+            "Poisson validity summary: "
+            f"locally repaired scenes={locally_repaired_scenes}, "
+            f"full median fallbacks={full_fallback_scenes}, "
+            f"repaired/fallback pixels={repaired_pixels}"
+        )
 
 
 def strict_prediction(path: Path, shape: tuple[int, int], method: str) -> np.ndarray:
@@ -642,12 +829,27 @@ def metric_values(prediction: np.ndarray, truth: np.ndarray, mask: np.ndarray) -
     }
 
 
-def region_masks(gt: np.ndarray, line_row: int, margin: int) -> dict[str, np.ndarray]:
+def distance_from_sparse_support(sparse_exact: np.ndarray) -> np.ndarray:
+    centers = np.isfinite(sparse_exact) & (sparse_exact > 0)
+    if not np.any(centers):
+        raise RuntimeError("The exact sparse measurement mask is empty")
+    try:
+        from scipy.ndimage import distance_transform_edt
+
+        return distance_transform_edt(~centers).astype(np.float32)
+    except ImportError as error:
+        raise RuntimeError("Evaluation requires scipy for distance-to-support masks") from error
+
+
+def region_masks(gt: np.ndarray, sparse_exact: np.ndarray, margin: int) -> dict[str, np.ndarray]:
     if margin < 0:
         raise ValueError("--outside-margin-px cannot be negative")
     valid = np.isfinite(gt) & (gt > 0) & (gt <= DEFAULT_MAX_DEPTH_M)
     yy = np.indices(gt.shape)[0]
-    outside = valid & (np.abs(yy - line_row) > margin)
+    support_distance = distance_from_sparse_support(sparse_exact)
+    outside = valid & (support_distance > margin)
+    center_rows = np.where(sparse_exact > 0)[0]
+    line_row = int(np.median(center_rows))
     return {
         "all_valid": valid,
         "outside_line_primary": outside,
@@ -671,6 +873,7 @@ class SurfacePatch:
     gt_m: float
     gt_span_m: float
     valid_pixels: int
+    distance_to_support_px: float
 
 
 def overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int], padding: int = 2) -> bool:
@@ -687,7 +890,7 @@ def overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int], padding
 def surface_candidates(
     gt: np.ndarray,
     valid: np.ndarray,
-    line_row: int,
+    support_distance: np.ndarray,
     outside_margin: int,
     span_max_m: float,
 ) -> list[dict[str, Any]]:
@@ -702,11 +905,12 @@ def surface_candidates(
     step_y, step_x = max(5, half_h), max(7, half_w)
     candidates: list[dict[str, Any]] = []
     for center_y in range(half_h, height - half_h, step_y):
-        if abs(center_y - line_row) <= outside_margin + half_h:
-            continue
         for center_x in range(half_w, width - half_w, step_x):
             y0, y1 = center_y - half_h, center_y + half_h + 1
             x0, x1 = center_x - half_w, center_x + half_w + 1
+            patch_support_distance = support_distance[y0:y1, x0:x1]
+            if float(np.min(patch_support_distance)) <= outside_margin:
+                continue
             patch_valid = valid[y0:y1, x0:x1]
             total = patch_valid.size
             count = int(np.count_nonzero(patch_valid))
@@ -726,6 +930,7 @@ def surface_candidates(
                     "gt_m": float(median),
                     "span_m": span,
                     "valid_pixels": count,
+                    "distance_to_support_px": float(support_distance[center_y, center_x]),
                 }
             )
     return candidates
@@ -733,23 +938,25 @@ def surface_candidates(
 
 def select_surface_patches(
     gt: np.ndarray,
-    line_row: int,
+    sparse_exact: np.ndarray,
     outside_margin: int,
     requested: int,
     span_max_m: float,
 ) -> list[SurfacePatch]:
     valid = np.isfinite(gt) & (gt > 0) & (gt <= DEFAULT_MAX_DEPTH_M)
-    candidates = surface_candidates(gt, valid, line_row, outside_margin, span_max_m)
+    support_distance = distance_from_sparse_support(sparse_exact)
+    candidates = surface_candidates(gt, valid, support_distance, outside_margin, span_max_m)
     if not candidates:
         return []
     height, width = gt.shape
+    median_candidate_depth = float(np.median([candidate["gt_m"] for candidate in candidates]))
     roles: list[tuple[str, Callable[[dict[str, Any]], float]]] = [
-        ("nearest stable surface", lambda c: c["gt_m"]),
-        ("farthest stable surface", lambda c: -c["gt_m"]),
-        ("upper stable surface", lambda c: c["center_y"]),
-        ("lower stable surface", lambda c: -c["center_y"]),
-        ("left stable surface", lambda c: c["center_x"]),
-        ("right stable surface", lambda c: -c["center_x"]),
+        ("near depth", lambda c: c["gt_m"]),
+        ("middle depth", lambda c: abs(c["gt_m"] - median_candidate_depth)),
+        ("far depth", lambda c: -c["gt_m"]),
+        ("far from support", lambda c: -c["distance_to_support_px"]),
+        ("upper off-support", lambda c: c["center_y"]),
+        ("lower off-support", lambda c: -c["center_y"]),
     ]
     chosen: list[tuple[str, dict[str, Any]]] = []
     for role, key in roles:
@@ -800,6 +1007,7 @@ def select_surface_patches(
                 gt_m=float(candidate["gt_m"]),
                 gt_span_m=float(candidate["span_m"]),
                 valid_pixels=int(candidate["valid_pixels"]),
+                distance_to_support_px=float(candidate["distance_to_support_px"]),
             )
         )
     return patches
@@ -837,6 +1045,7 @@ def evaluate_surface_patches(
                     "x1": patch.x1,
                     "gt_m": patch.gt_m,
                     "gt_span_p10_p90_m": patch.gt_span_m,
+                    "distance_to_lidar_support_px": patch.distance_to_support_px,
                     "pred_m": predicted_m,
                     "signed_error_m": signed_error,
                     "abs_error_m": absolute_error,
@@ -875,6 +1084,7 @@ def draw_patch_boxes(axis: Any, patches: Sequence[SurfacePatch], values: dict[st
 
 def panel_for_scene(
     scene: str,
+    line_protocol: str,
     rgb: np.ndarray,
     gt: np.ndarray,
     sparse_exact: np.ndarray,
@@ -936,22 +1146,22 @@ def panel_for_scene(
         table_rows.append(
             [
                 patch.code,
+                patch.role,
                 f"{patch.gt_m:.2f}",
-                f"{da3_value['pred_m']:.2f}",
-                f"{da3_value['abs_error_m']:.2f}",
-                f"{a2f_value['pred_m']:.2f}",
-                f"{a2f_value['abs_error_m']:.2f}",
+                f"{da3_value['pred_m']:.2f} ({da3_value['pred_m'] - patch.gt_m:+.2f})",
+                f"{a2f_value['pred_m']:.2f} ({a2f_value['pred_m'] - patch.gt_m:+.2f})",
                 winner,
             ]
         )
     table = table_axis.table(
         cellText=table_rows,
-        colLabels=["Surface", "GT m", "DA3+P m", "DA3+P |e|", "A2F m", "A2F |e|", "Winner"],
+        colLabels=["Probe", "Surface role", "GT m", "DA3+P m (Δ)", "A2F m (Δ)", "Winner"],
         cellLoc="center",
+        colWidths=[0.09, 0.22, 0.11, 0.22, 0.22, 0.14],
         loc="center",
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(8)
+    table.set_fontsize(7.5)
     table.scale(1.0, 1.55)
     table_axis.set_title("Locally stable surface measurements\n(patch medians; lower |error| is better)")
 
@@ -959,7 +1169,7 @@ def panel_for_scene(
     draw_patch_boxes(axes[1, 0], patches, by_method_surface["da3_median_poisson"])
     da3_metrics = scene_metrics[("da3_median_poisson", "outside_line_primary")]
     axes[1, 0].set_title(
-        f"DA3-SMALL + median + Poisson\noutside-line RMSE {da3_metrics['rmse_m']:.3f} m | "
+        f"DA3-SMALL + median + Poisson\noutside-support RMSE {da3_metrics['rmse_m']:.3f} m | "
         f"MAE {da3_metrics['mae_m']:.3f} m | bias {da3_metrics['bias_m']:+.3f} m"
     )
 
@@ -967,7 +1177,7 @@ def panel_for_scene(
     draw_patch_boxes(axes[1, 1], patches, by_method_surface["any2full"])
     a2f_metrics = scene_metrics[("any2full", "outside_line_primary")]
     axes[1, 1].set_title(
-        f"Any2Full metric depth\noutside-line RMSE {a2f_metrics['rmse_m']:.3f} m | "
+        f"Any2Full metric depth\noutside-support RMSE {a2f_metrics['rmse_m']:.3f} m | "
         f"MAE {a2f_metrics['mae_m']:.3f} m | bias {a2f_metrics['bias_m']:+.3f} m"
     )
 
@@ -982,7 +1192,7 @@ def panel_for_scene(
     figure.colorbar(depth_image, ax=[axes[0, 1], axes[1, 0], axes[1, 1]], shrink=0.72, label="Camera-Z metric depth (m)")
     figure.colorbar(difference_image, ax=axes[1, 2], shrink=0.72, label="|error A2F| − |error DA3| (m)")
     figure.suptitle(
-        f"{scene} — full metric-depth comparison\n"
+        f"{scene} — full metric-depth comparison — protocol: {line_protocol}\n"
         "All depth panels share one fixed scale; dense GT was not used to align either prediction.",
         fontsize=14,
     )
@@ -1187,7 +1397,7 @@ def paired_bootstrap(
             {
                 "comparison": "DA3-SMALL + median + Poisson minus Any2Full",
                 "unit": "m",
-                "region": "stable_surface_patches_outside_line",
+                "region": "stable_surface_patches_outside_support",
                 "metric": "mean_surface_abs_error_m",
                 "paired_scene_count": len(surface_scenes),
                 "mean_difference": float(np.mean(surface_differences)),
@@ -1221,8 +1431,8 @@ def make_leaderboard(
     colors = ["#2878b5", "#e07a1f"]
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
     quantities = [
-        ([outside[method]["pooled_rmse_m"] for method in methods], "Outside-line dense RMSE", "metres"),
-        ([outside[method]["pooled_mae_m"] for method in methods], "Outside-line dense MAE", "metres"),
+        ([outside[method]["pooled_rmse_m"] for method in methods], "Outside-support dense RMSE", "metres"),
+        ([outside[method]["pooled_mae_m"] for method in methods], "Outside-support dense MAE", "metres"),
         ([surfaces[method]["surface_mae_m"] for method in methods], "Stable-surface MAE", "metres"),
     ]
     for axis, (values, title, unit) in zip(axes, quantities):
@@ -1243,6 +1453,8 @@ def write_report(
     pixel_summary: Sequence[dict[str, Any]],
     surface_summary: Sequence[dict[str, Any]],
     paired: Sequence[dict[str, Any]],
+    line_protocol: str,
+    poisson_validity: dict[str, Any] | None,
     output: Path,
 ) -> None:
     outside = [
@@ -1267,18 +1479,41 @@ def write_report(
         "",
         "## Fixed protocol",
         "",
+        f"- **Line protocol:** `{line_protocol}` (see `evaluated_protocol.json` for the complete definition).",
         "- Official 654-image NYU test split at 304 × 228 (unless a smoke-test limit was used).",
-        "- The same RPLidar-like sparse input is supplied to DA3 alignment and Any2Full.",
+        "- The exact same sparse input array is supplied to DA3 alignment and Any2Full.",
         "- The primary DA3 system is DA3-SMALL + one-line global median metric scaling + Poisson refinement.",
         "- DA3-SMALL + median without Poisson is retained only as an ablation.",
         "- Dense GT is never used to align either final prediction.",
-        "- Primary result: dense camera-Z RMSE in metres outside a margin around the input line.",
-        "- Surface result: median metric depth over locally stable GT patches outside that line.",
+        "- Primary result: dense camera-Z RMSE in metres outside a margin around the actual sparse support.",
+        "- Surface result: median metric depth over locally stable GT patches outside that support.",
         "- AbsRel is retained only as a secondary literature metric.",
-        "",
-        "## Primary outside-line dense metric result (DA3-SMALL + median + Poisson vs Any2Full)",
-        "",
     ]
+    if poisson_validity is not None:
+        lines.extend(
+            [
+                "",
+                "## Poisson numerical validity",
+                "",
+                f"- Evaluated DA3 scenes with inference diagnostics: "
+                f"{poisson_validity['diagnostic_scene_count']}.",
+                f"- Scenes requiring isolated-pixel repair: "
+                f"{poisson_validity['locally_repaired_scene_count']}.",
+                f"- Scenes requiring a full DA3+median fallback: "
+                f"{poisson_validity['full_median_fallback_scene_count']}.",
+                f"- Total pixels replaced by the declared median fallback: "
+                f"{poisson_validity['repaired_or_fallback_pixel_count']}.",
+                "- Every repair is recorded per scene in the DA3 `fit_parameters.csv`; "
+                "valid Poisson pixels were not changed.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Primary outside-support dense metric result (DA3-SMALL + median + Poisson vs Any2Full)",
+            "",
+        ]
+    )
     for row in sorted(outside, key=lambda item: float(item.get("pooled_rmse_m", math.inf))):
         lines.append(
             f"- **{row['method_label']}**: pooled RMSE {row['pooled_rmse_m']:.4f} m; "
@@ -1301,7 +1536,7 @@ def write_report(
     lines.extend(["", "## Median-only DA3 ablation", ""])
     for row in outside_ablation:
         lines.append(
-            f"- **{row['method_label']}** outside-line: pooled RMSE {row['pooled_rmse_m']:.4f} m; "
+            f"- **{row['method_label']}** outside-support: pooled RMSE {row['pooled_rmse_m']:.4f} m; "
             f"MAE {row['pooled_mae_m']:.4f} m; bias {row['pooled_bias_m']:+.4f} m."
         )
     for row in surface_ablation:
@@ -1322,7 +1557,7 @@ def write_report(
             "",
             "## Interpretation rule",
             "",
-            "A method is called the stronger NYU indoor metric system only if its outside-line dense RMSE "
+            "A method is called the stronger NYU indoor metric system only if its outside-support dense RMSE "
             "advantage is supported by the paired bootstrap and is not contradicted by stable-surface MAE. "
             "The NYU result must then be considered together with the already-completed iBims result; the "
             "two datasets are reported separately rather than pooling their pixels.",
@@ -1334,15 +1569,63 @@ def write_report(
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def summarize_poisson_validity(
+    da3_dir: Path,
+    selected_scenes: set[str],
+) -> dict[str, Any] | None:
+    path = da3_dir / "fit_parameters.csv"
+    if not path.is_file():
+        return None
+    fit_rows = [row for row in read_csv(path) if row.get("scene") in selected_scenes]
+    if not fit_rows or "poisson_status" not in fit_rows[0]:
+        return None
+    status_counts: dict[str, int] = defaultdict(int)
+    repaired_pixels = 0
+    fallback_scenes: list[str] = []
+    locally_repaired_scenes: list[str] = []
+    for row in fit_rows:
+        status = row.get("poisson_status", "unknown")
+        status_counts[status] += 1
+        repaired_pixels += int(float(row.get("poisson_repaired_invalid_pixels", 0) or 0))
+        if status == "full_median_fallback":
+            fallback_scenes.append(row["scene"])
+        elif status == "locally_repaired":
+            locally_repaired_scenes.append(row["scene"])
+    return {
+        "diagnostic_scene_count": len(fit_rows),
+        "status_counts": dict(sorted(status_counts.items())),
+        "locally_repaired_scene_count": len(locally_repaired_scenes),
+        "locally_repaired_scenes": locally_repaired_scenes,
+        "full_median_fallback_scene_count": len(fallback_scenes),
+        "full_median_fallback_scenes": fallback_scenes,
+        "repaired_or_fallback_pixel_count": repaired_pixels,
+    }
+
+
 def evaluate(args: argparse.Namespace) -> None:
     data_root = ensure_dir(args.data_root, "prepared NYU data root")
     da3_dir = ensure_dir(args.da3_dir, "DA3 output directory")
     any2full_dir = ensure_dir(args.any2full_dir, "Any2Full output directory")
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    protocol_path = data_root / "protocol.json"
+    if not protocol_path.is_file():
+        raise FileNotFoundError(f"Prepared protocol metadata is missing: {protocol_path}")
+    protocol_payload = json.loads(protocol_path.read_text(encoding="utf-8"))
+    line_protocol = str(protocol_payload.get("line_protocol", "legacy_unspecified"))
+    (output_dir / "evaluated_protocol.json").write_text(
+        json.dumps(protocol_payload, indent=2) + "\n", encoding="utf-8"
+    )
     if args.plot_max_depth_m <= 0 or args.plot_error_max_m <= 0:
         raise ValueError("plot scales must be positive")
     rows = load_manifest(data_root, args.limit)
+    poisson_validity = summarize_poisson_validity(
+        da3_dir, {str(row["scene"]) for row in rows}
+    )
+    if poisson_validity is not None:
+        (output_dir / "poisson_validity_summary.json").write_text(
+            json.dumps(poisson_validity, indent=2) + "\n", encoding="utf-8"
+        )
 
     da3_metric_dir = da3_dir / "metric_m" if (da3_dir / "metric_m").is_dir() else da3_dir
     if args.da3_poisson_dir is not None:
@@ -1376,7 +1659,7 @@ def evaluate(args: argparse.Namespace) -> None:
             method: strict_prediction(directory / f"{stem}.npy", gt.shape, method)
             for method, directory in method_dirs.items()
         }
-        masks = region_masks(gt, line_row, args.outside_margin_px)
+        masks = region_masks(gt, sparse_exact, args.outside_margin_px)
         scene_metric_lookup: dict[tuple[str, str], dict[str, float]] = {}
         for method, prediction in predictions.items():
             for region, mask in masks.items():
@@ -1395,7 +1678,7 @@ def evaluate(args: argparse.Namespace) -> None:
 
         patches = select_surface_patches(
             gt,
-            line_row,
+            sparse_exact,
             args.outside_margin_px,
             args.surface_probes,
             args.surface_span_max_m,
@@ -1408,12 +1691,14 @@ def evaluate(args: argparse.Namespace) -> None:
             fieldnames=(
                 "scene", "surface", "surface_role", "method", "method_label",
                 "y0", "y1", "x0", "x1", "gt_m", "gt_span_p10_p90_m",
+                "distance_to_lidar_support_px",
                 "pred_m", "signed_error_m", "abs_error_m", "winner_between_primary_methods",
             ),
         )
         if not args.skip_panels:
             panel_for_scene(
                 stem,
+                line_protocol,
                 rgb,
                 gt,
                 sparse_exact,
@@ -1442,7 +1727,14 @@ def evaluate(args: argparse.Namespace) -> None:
     save_csv(output_dir / "summary_surfaces.csv", surface_summary)
     save_csv(output_dir / "paired_bootstrap_da3_vs_any2full.csv", paired)
     make_leaderboard(pixel_summary, surface_summary, output_dir / "nyu_metric_leaderboard.png")
-    write_report(pixel_summary, surface_summary, paired, output_dir / "comparison_report.md")
+    write_report(
+        pixel_summary,
+        surface_summary,
+        paired,
+        line_protocol,
+        poisson_validity,
+        output_dir / "comparison_report.md",
+    )
 
     print("\n===== NYU ONE-LINE DENSE METRIC RESULT =====")
     for row in pixel_summary:
@@ -1458,6 +1750,14 @@ def evaluate(args: argparse.Namespace) -> None:
             f"{row['region']:<38} {row['metric']:<28} "
             f"DA3+P-A2F={row['mean_difference']:+.4f}m "
             f"CI[{row['ci95_low']:+.4f},{row['ci95_high']:+.4f}] {row['interpretation']}"
+        )
+    if poisson_validity is not None:
+        print(
+            "\nPoisson validity: "
+            f"locally repaired scenes={poisson_validity['locally_repaired_scene_count']}, "
+            f"full median fallbacks={poisson_validity['full_median_fallback_scene_count']}, "
+            f"repaired/fallback pixels="
+            f"{poisson_validity['repaired_or_fallback_pixel_count']}"
         )
     print(f"\nOutput: {output_dir}")
 

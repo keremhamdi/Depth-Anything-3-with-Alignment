@@ -1,0 +1,19 @@
+cd "/home/user/İndirilenler/Lidar Proje/Depth-Anything-3"
+conda activate da3
+
+# Same env vars you used for the good20 run
+export DA3_ROOT="/home/user/İndirilenler/Lidar Proje/Depth-Anything-3"
+export A2F_ROOT="/home/user/İndirilenler/Lidar Proje/Proj"
+# Add DATA_ROOT here too if you exported it for the good20 run
+
+OMP_NUM_THREADS=1 \
+OPENBLAS_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
+NUMEXPR_NUM_THREADS=1 \
+PYTHONPATH=src \
+python -u \
+  experiments/lidar_alignment/ibims/ibims_bad20_da3_median_poisson.py
+
+# Open the resulting contact sheet
+BAD20_DIR="$(pwd)/experiments/lidar_alignment/outputs/comparison_median_poisson_oasis_v21_100_final/examples_bad20_da3_median_poisson"
+xdg-open "$BAD20_DIR/00_bad20_contact_sheet.png"
